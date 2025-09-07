@@ -46,9 +46,16 @@ class RaftNode(threading.Thread):
         self.my_id = address_book[name]['ip'] + ':' + address_book[name]['port']
 
         # Timing variables
-        self.election_timeout = random.uniform(0.1, 0.1+0.05*len(self.all_ids)) # Failed vote backoff, used for pretty much all timing related things.
-        self.heartbeat_frequency = 0.01                                     # How often to send heartbeat (should be less than the election timeout).
-        self.resend_time = 2.0                                              # How often to resend an append entries if you havent heard from a node in a while. 
+        # self.election_timeout = random.uniform(0.1, 0.1+0.05*len(self.all_ids)) # Failed vote backoff, used for pretty much all timing related things.
+        # self.heartbeat_frequency = 0.01                                     # How often to send heartbeat (should be less than the election timeout).
+        # self.resend_time = 2.0                                              # How often to resend an append entries if you havent heard from a node in a while. 
+
+        # changes by hamza to make it a little slower for testing
+        # To (much slower):
+        self.election_timeout = random.uniform(10.0, 15.0)  # 5-8 seconds
+        self.heartbeat_frequency = 5.0  # 2 seconds between heartbeats
+        self.resend_time = 20.0  # 10 seconds
+
 
         # State variables that I've added
         self._name = name                                                   # Your name. Used mostly for debugging.
