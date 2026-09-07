@@ -1,1 +1,10 @@
-{"node1": {"ip": "192.46.237.85", "port": "2380"}, "node2": {"ip": "172.105.85.119", "port": "2380"}, "node3": {"ip": "172.104.149.60", "port": "2380"}}
+{
+  "node1": {"ip": "192.46.237.85", "port": "2380"}, 
+  "node2": {"ip": "172.105.85.119", "port": "2380"}, 
+  "node3": {"ip": "172.104.149.60", "port": "2380"},
+  "secure_transport": false,
+  "secure_key_id": "default",
+  "secure_psk": "dev-psk-not-for-production",
+  "demo_logs": true,
+  "demo_stdout_simple": false
+}

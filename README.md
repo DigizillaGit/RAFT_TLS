@@ -19,9 +19,9 @@ This package has been tested with python2.7 and python3.6.
 from raft import RaftNode
 import time
 
-comm_dict = {"node0": {"ip": "127.0.0.1", "port": "5567"}, 
-  "node1": {"ip": "127.0.0.1", "port": "5566"}, 
-  "node2": {"ip": "127.0.0.1", "port": "5565"}}
+comm_dict = {"node1": {"ip": "192.46.237.85", "port": "2380"}, 
+  "node2": {"ip": "172.105.85.119", "port": "2380"}, 
+  "node3": {"ip": "172.104.149.60", "port": "2380"}}
 
 # Start a few nodes
 nodes = [RaftNode(comm_dict, 'node0'),

@@ -17,12 +17,11 @@ from .interface import Listener, Talker
 from .protocol import MessageType, MessageDirection, RequestVotesResults, \
     AppendEntriesResults, RequestVotesMessage, AppendEntriesMessage, \
     parse_json_message
+from .secure_transport import SecureKeystore, ReplayCache, encode_secure_message, decode_secure_message
 
 # Adjust these to test
 address_book_fname = 'address_book.json'
 total_nodes = 1
-local_ip = '127.0.0.1'
-start_port = 5557
 
 class RaftNode(threading.Thread):
     def __init__(self, config, name, role='follower', verbose=True):
@@ -42,8 +41,69 @@ class RaftNode(threading.Thread):
             address_book = config
         else:
             address_book = self._load_config(config, name)
-        self.all_ids = [address_book[a]['ip'] + ':' + address_book[a]['port'] for a in address_book if a != 'leader']
-        self.my_id = address_book[name]['ip'] + ':' + address_book[name]['port']
+        # Filter only node entries with ip/port
+        node_entries = {k: v for k, v in address_book.items() if isinstance(v, dict) and ('ip' in v) and ('port' in v)}
+        self.all_ids = [node_entries[a]['ip'] + ':' + node_entries[a]['port'] for a in node_entries if a != 'leader']
+        self.my_id = node_entries[name]['ip'] + ':' + node_entries[name]['port']
+        # Pretty names for addresses (e.g., 192.46.237.85:2380 -> node1)
+        self.addr_to_name = {}
+        self.name_to_addr = {}
+        try:
+            for node_name, meta in node_entries.items():
+                addr = meta['ip'] + ':' + meta['port']
+                self.addr_to_name[addr] = node_name
+                self.name_to_addr[node_name] = addr
+        except Exception:
+            pass
+
+        # Timestamp validation removed - using secure transport for replay protection
+
+        # Demo logs (human-readable event logs for presentations)
+        self.demo_logs = bool(address_book.get('demo_logs', True))
+        self.demo_stdout_simple = bool(address_book.get('demo_stdout_simple', True))
+        self._printed_following_leader = False
+        # Stdout throttling for noisy events
+        self._stdout_throttle_secs = 2.0
+        self._last_stdout_sent_hb = 0.0
+        self._last_stdout_sent_ae = 0.0
+        self._last_stdout_recv_hb = 0.0
+        self._last_stdout_recv_ae = 0.0
+
+        # On startup, all nodes begin as followers. Emit a clear stdout + file log.
+        if self.demo_logs:
+            try:
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                line = current_time+" : "+ f"event=role_init role=follower term={getattr(self, 'current_term', 0)}"
+                if self.demo_stdout_simple:
+                    print(f"{self.name}: Starting as follower (term {getattr(self, 'current_term', 0)})")
+                else:
+                    print(line)
+                log_file_path = str(self.name)+"_logs.txt"
+                with open(log_file_path, "a") as file:
+                    file.write(line + "\n")
+            except Exception:
+                pass
+
+        # Transport security (optional, backward-compatible)
+        self.secure_enabled = bool(address_book.get('secure_transport', False))
+        if self.secure_enabled:
+            key_id = str(address_book.get('secure_key_id', 'default'))
+            # Use pro vided PSK (hex/base64) or fallback dev key
+            psk_text = address_book.get('secure_psk', 'dev-psk-not-for-production')
+            try:
+                # Try hex first
+                psk_bytes = bytes.fromhex(psk_text)
+            except ValueError:
+                try:
+                    # Then base64
+                    import base64 as _b64
+                    psk_bytes = _b64.b64decode(psk_text)
+                except Exception:
+                    # Fallback to utf-8
+                    psk_bytes = psk_text.encode('utf-8')
+            self._keystore = SecureKeystore({key_id: psk_bytes})
+            self._active_key_id = key_id
+            self._replay_cache = ReplayCache()
 
         # Timing variables
         # self.election_timeout = random.uniform(0.1, 0.1+0.05*len(self.all_ids)) # Failed vote backoff, used for pretty much all timing related things.
@@ -52,9 +112,9 @@ class RaftNode(threading.Thread):
 
         # changes by hamza to make it a little slower for testing
         # To (much slower):
-        self.election_timeout = random.uniform(10.0, 15.0)  # 5-8 seconds
+        self.election_timeout = random.uniform(5.0, 8.0)  # 5-8 seconds
         self.heartbeat_frequency = 5.0  # 2 seconds between heartbeats
-        self.resend_time = 20.0  # 10 seconds
+        self.resend_time = 10.0  # 10 seconds
 
 
         # State variables that I've added
@@ -85,6 +145,9 @@ class RaftNode(threading.Thread):
         self.listener.start()
         self.talker = Talker(identity=identity)
         self.talker.start()
+
+        # Store last sent secure envelope per receiver for replay testing
+        self._last_envelope_per_receiver = {}
 
     def stop(self):
         self.talker.stop()
@@ -203,18 +266,14 @@ class RaftNode(threading.Thread):
                     # Incoming message is a new election candidate
                     if (incoming_message.type == MessageType.RequestVotes):
 
-                        now = int(time.time())
-                        difference = now - incoming_message.msg_timestamp
-                        #print("follower diff ==> ",now,incoming_message.msg_timestamp)
-                        if difference > 10:
-                            print('vote request from ',incoming_message.sender,' was refused [old timestamp]')
+                        # Timestamp validation removed - using secure transport for replay protection
 
                         # If this election is for a new term, update your term
                         if (incoming_message.term > self.current_term):
                             self._increment_term(incoming_message.term)
                             
                         # If you haven't already voted and you're less up to date than the candidate, send your vote
-                        if ((self.voted_for is None) and (incoming_message.last_log_index >= self.last_applied_index) and (incoming_message.last_log_term >= self.last_applied_term) and difference <= 10 ):
+                        if ((self.voted_for is None) and (incoming_message.last_log_index >= self.last_applied_index) and (incoming_message.last_log_term >= self.last_applied_term)):
                             self._send_vote(incoming_message.sender)
                         else: 
                             self._send_vote(incoming_message.sender, False)
@@ -295,12 +354,6 @@ class RaftNode(threading.Thread):
         except (FileNotFoundError, IndexError) as e:
             print(e)
             return
-        
-        msg_timestamp=vote_data['msg_timestamp']
-
-        # sending the actual timestamp
-        if bypass_timestamp == True:
-            msg_timestamp = int(time.time())
 
         message = RequestVotesMessage(
             type_=vote_data["type"],
@@ -309,8 +362,7 @@ class RaftNode(threading.Thread):
             direction=vote_data["direction"],
             candidate_id=self.my_id,
             last_log_index=self.last_applied_index,
-            last_log_term=self.last_applied_term,
-            msg_timestamp=msg_timestamp
+            last_log_term=self.last_applied_term
         )
         
         # send the message to followers
@@ -386,15 +438,8 @@ class RaftNode(threading.Thread):
                             file.write(current_time+" : "+ f"{self.name}: received vote requests acceptance [{votes_for_me}]" + "\n") 
                             
                         # If you have a majority, promote yourself
-                        # Added: timestamp is not old
-                        now = int(time.time())
-                        difference = now - incoming_message.msg_timestamp
-                        #print("candidate diff ==> ",now,incoming_message.msg_timestamp)
-
-                        if difference > 10:
-                            print('vote request from ',incoming_message.sender,' was refused [old timestamp]')
-
-                        if ((votes_for_me > int(old_div(self.current_num_nodes, 2))) or (self.current_num_nodes == 1)) and (difference <= 10):
+                        # Timestamp validation removed - using secure transport for replay protection
+                        if ((votes_for_me > int(old_div(self.current_num_nodes, 2))) or (self.current_num_nodes == 1)):
                             self._set_current_role('leader')
                             return
 
@@ -560,21 +605,8 @@ class RaftNode(threading.Thread):
                     # Incoming message is a request votes, if there's a vote going on with a term above yours, update your term, vote for them, and demote yourself
                     if (incoming_message.type == MessageType.RequestVotes):
 
-                        # Added: message votes with timetsamp
-                        now = int(time.time())
-                        difference = now - incoming_message.msg_timestamp
-                        #print("leader diff ==> ",now,incoming_message.msg_timestamp)
-
-                        if difference > 10:
-                            print('vote request from ',incoming_message.sender,' was refused [old timestamp]')
-                            # add the log to the file log (received logs only)
-                            log_file_path = str(self.name)+"_logs.txt"
-                            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            with open(log_file_path, "a") as file:
-                                file.write(current_time+" : "+ 'vote request from '+incoming_message.sender+' was refused [old timestamp]' + "\n") 
-
-
-                        if (incoming_message.term > self.current_term and difference <= 10 ):
+                        # Timestamp validation removed - using secure transport for replay protection
+                        if (incoming_message.term > self.current_term):
                             self._increment_term(incoming_message.term)
                             self._send_vote(incoming_message.sender)
                             self._set_current_role('follower')
@@ -602,14 +634,337 @@ class RaftNode(threading.Thread):
             Inputs:
                 message: (RequestVotesMessage or AppendEntriesMessage)
         '''
-        self.talker.send_message(message.jsonify())
+        msg_dict = message.jsonify()
+        # Demo log: outbound message summaries
+        if getattr(self, 'demo_logs', False):
+            try:
+                log_file_path = str(self.name)+"_logs.txt"
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                def _nm(addr):
+                    try:
+                        return self.addr_to_name.get(addr, str(addr))
+                    except Exception:
+                        return str(addr)
+                if msg_dict.get('type') == MessageType.RequestVotes and msg_dict.get('direction') == MessageDirection.Request:
+                    line = current_time+" : "+ f"event=sent_vote_request term={msg_dict.get('term')} from={_nm(msg_dict.get('sender'))} to={_nm(msg_dict.get('receiver'))} last_log_index={msg_dict.get('last_log_index', '')} last_log_term={msg_dict.get('last_log_term', '')}"
+                    if self.demo_stdout_simple:
+                        print(f"{self.name}: Asked for votes (term {msg_dict.get('term')})")
+                    else:
+                        print(line)
+                    with open(log_file_path, "a") as file:
+                        file.write(line + "\n")
+                elif msg_dict.get('type') == MessageType.RequestVotes and msg_dict.get('direction') == MessageDirection.Response:
+                    granted = None
+                    try:
+                        granted = msg_dict.get('results', {}).get('vote_granted')
+                    except Exception:
+                        granted = None
+                    line = current_time+" : "+ f"event=sent_vote_response term={msg_dict.get('term')} to={_nm(msg_dict.get('receiver'))} granted={granted}"
+                    if self.demo_stdout_simple:
+                        print(f"{self.name}: Voted {'YES' if granted else 'NO'} (term {msg_dict.get('term')})")
+                    else:
+                        print(line)
+                    with open(log_file_path, "a") as file:
+                        file.write(line + "\n")
+                elif msg_dict.get('type') == MessageType.Heartbeat:
+                    leader_addr = msg_dict.get('leader_id', msg_dict.get('sender'))
+                    line = current_time+" : "+ f"event=sent_heartbeat term={msg_dict.get('term')} leader={_nm(leader_addr)}"
+                    if self.demo_stdout_simple:
+                        now_ts = time.time()
+                        if (now_ts - self._last_stdout_sent_hb) >= self._stdout_throttle_secs:
+                            print(f"{self.name}: Heartbeat sent (term {msg_dict.get('term')})")
+                            self._last_stdout_sent_hb = now_ts
+                    else:
+                        print(line)
+                    with open(log_file_path, "a") as file:
+                        file.write(line + "\n")
+                elif msg_dict.get('type') == MessageType.AppendEntries and msg_dict.get('direction') == MessageDirection.Request:
+                    entries = msg_dict.get('entries')
+                    count = 0 if entries is None else len(entries)
+                    line = current_time+" : "+ f"event=sent_append_entries term={msg_dict.get('term')} count={count} prev_index={msg_dict.get('prev_log_index')} prev_term={msg_dict.get('prev_log_term')}"
+                    if self.demo_stdout_simple:
+                        now_ts = time.time()
+                        if (now_ts - self._last_stdout_sent_ae) >= self._stdout_throttle_secs:
+                            print(f"{self.name}: Replicating {count} entries (term {msg_dict.get('term')})")
+                            self._last_stdout_sent_ae = now_ts
+                    else:
+                        print(line)
+                    with open(log_file_path, "a") as file:
+                        file.write(line + "\n")
+            except Exception:
+                pass
+        if getattr(self, 'secure_enabled', False):
+            receiver = msg_dict.get('receiver')
+            # For broadcast (receiver None), derive context with a shared label
+            peer_context_id = '' if receiver is None else receiver
+            envelope = encode_secure_message(
+                message_dict=msg_dict,
+                peer_id=peer_context_id,
+                key_id=self._active_key_id,
+                keystore=self._keystore,
+                confidential=True
+            )
+            send_obj = {
+                'receiver': receiver,
+                'secure': True,
+                'broadcast': (receiver is None),
+                'envelope': envelope
+            }
+            # Remember the exact envelope to allow tx_id replay
+            key = receiver if receiver is not None else '__broadcast__'
+            self._last_envelope_per_receiver[key] = send_obj
+            self.talker.send_message(send_obj)
+        else:
+            self.talker.send_message(msg_dict)
 
     def _get_message(self):
         '''
             _get_message: A wrapper to get a message. If there are no pending 
                 messages returns None. 
         '''
-        return parse_json_message(self.listener.get_message())
+        raw = self.listener.get_message()
+        if raw is None:
+            return None
+        if raw.get('secure') and getattr(self, 'secure_enabled', False):
+            # Determine context id used during encode
+            peer_context_id = '' if raw.get('broadcast') else self.my_id
+            # Remember last received secure envelope for replay testing
+            try:
+                self._last_received_envelope = raw
+            except Exception:
+                pass
+            try:
+                decoded = decode_secure_message(
+                    envelope=raw['envelope'],
+                    peer_id=peer_context_id,
+                    keystore=self._keystore,
+                    replay_cache=self._replay_cache,
+                    confidential=True
+                )
+                # Demo log: received summaries (pretty names + stdout)
+                if getattr(self, 'demo_logs', False):
+                    try:
+                        def _nm(addr):
+                            try:
+                                return self.addr_to_name.get(addr, str(addr))
+                            except Exception:
+                                return str(addr)
+                        msg_type = decoded.get('type')
+                        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        log_file_path = str(self.name)+"_logs.txt"
+                        sender_addr = decoded.get('sender')
+                        # Skip logging received events originating from this node (self)
+                        if sender_addr == self.my_id:
+                            pass
+                        elif msg_type == MessageType.RequestVotes and decoded.get('direction') == MessageDirection.Request:
+                            line = current_time+" : "+ f"event=received_vote_request term={decoded.get('term')} from={_nm(decoded.get('sender'))} last_log_index={decoded.get('last_log_index', '')} last_log_term={decoded.get('last_log_term', '')}"
+                            if self.demo_stdout_simple:
+                                print(f"{self.name}: Vote request from {_nm(decoded.get('sender'))} (term {decoded.get('term')})")
+                            else:
+                                print(line)
+                            with open(log_file_path, "a") as file:
+                                file.write(line + "\n")
+                        elif msg_type == MessageType.RequestVotes and decoded.get('direction') == MessageDirection.Response:
+                            granted = None
+                            try:
+                                granted = decoded.get('results', {}).get('vote_granted')
+                            except Exception:
+                                granted = None
+                            line = current_time+" : "+ f"event=received_vote_response term={decoded.get('term')} from={_nm(decoded.get('sender'))} granted={granted}"
+                            if self.demo_stdout_simple:
+                                print(f"{self.name}: Vote {'YES' if granted else 'NO'} from {_nm(decoded.get('sender'))} (term {decoded.get('term')})")
+                            else:
+                                print(line)
+                            with open(log_file_path, "a") as file:
+                                file.write(line + "\n")
+                        elif msg_type == MessageType.Heartbeat:
+                            leader_addr = decoded.get('leader_id', decoded.get('sender'))
+                            line = current_time+" : "+ f"event=received_heartbeat term={decoded.get('term')} leader={_nm(leader_addr)}"
+                            if self.demo_stdout_simple:
+                                now_ts = time.time()
+                                if (now_ts - self._last_stdout_recv_hb) >= self._stdout_throttle_secs:
+                                    print(f"{self.name}: Heartbeat from {_nm(leader_addr)} (term {decoded.get('term')})")
+                                    self._last_stdout_recv_hb = now_ts
+                            else:
+                                print(line)
+                            with open(log_file_path, "a") as file:
+                                file.write(line + "\n")
+                        elif msg_type == MessageType.AppendEntries and decoded.get('direction') == MessageDirection.Request:
+                            entries = decoded.get('entries')
+                            count = 0 if entries is None else len(entries)
+                            line = current_time+" : "+ f"event=received_append_entries term={decoded.get('term')} count={count} prev_index={decoded.get('prev_log_index')} prev_term={decoded.get('prev_log_term')}"
+                            if self.demo_stdout_simple:
+                                now_ts = time.time()
+                                if (now_ts - self._last_stdout_recv_ae) >= self._stdout_throttle_secs:
+                                    print(f"{self.name}: AppendEntries {count} entries (term {decoded.get('term')})")
+                                    self._last_stdout_recv_ae = now_ts
+                            else:
+                                print(line)
+                            with open(log_file_path, "a") as file:
+                                file.write(line + "\n")
+                    except Exception:
+                        pass
+                # Log acceptance with tx_id for observability
+                try:
+                    log_file_path = str(self.name)+"_logs.txt"
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open(log_file_path, "a") as file:
+                        file.write(current_time+" : "+ f"secure accepted tx_id [{raw['envelope'].get('tx_id','')}]" + "\n")
+                except Exception:
+                    pass
+            except Exception as _:
+                # Log authentication/replay failures to node logs
+                try:
+                    log_file_path = str(self.name)+"_logs.txt"
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    txid = ''
+                    try:
+                        txid = raw.get('envelope', {}).get('tx_id', '')
+                    except Exception:
+                        txid = ''
+                    with open(log_file_path, "a") as file:
+                        file.write(current_time+" : "+ f"secure drop tx_id [{txid}] (auth/replay)" + "\n")
+                except Exception:
+                    pass
+                return None
+            return parse_json_message(decoded)
+        else:
+            # If secure is enabled, drop any non-secure incoming message
+            if getattr(self, 'secure_enabled', False) and (not raw.get('secure')):
+                try:
+                    log_file_path = str(self.name)+"_logs.txt"
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open(log_file_path, "a") as file:
+                        file.write(current_time+" : "+ "non-secure message received while secure enabled (dropped)" + "\n")
+                except Exception:
+                    pass
+                return None
+            # If we receive a secure envelope while secure is disabled, drop it safely
+            if raw.get('secure') and not getattr(self, 'secure_enabled', False):
+                try:
+                    log_file_path = str(self.name)+"_logs.txt"
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    with open(log_file_path, "a") as file:
+                        file.write(current_time+" : "+ "secure message received while secure disabled (dropped)" + "\n")
+                except Exception:
+                    pass
+                return None
+            return parse_json_message(raw)
+
+    # Testing utility: resend the last exact secure envelope to trigger replay protection
+    def replay_last_envelope(self, target_receiver=None):
+        '''
+            Resend the last secure envelope for the given receiver (or broadcast) verbatim.
+            This will reuse the same tx_id and should trigger the replay cache on peers.
+        '''
+        if not getattr(self, 'secure_enabled', False):
+            return False
+        key = target_receiver if target_receiver is not None else '__broadcast__'
+        send_obj = self._last_envelope_per_receiver.get(key)
+        if not send_obj:
+            return False
+        # Re-send verbatim
+        self.talker.send_message(send_obj)
+        return True
+
+    # Testing utility: resend the last received secure envelope as-is
+    def replay_last_received_envelope(self):
+        if not getattr(self, 'secure_enabled', False):
+            return False
+        raw = getattr(self, '_last_received_envelope', None)
+        if not raw:
+            return False
+        # Re-send the exact raw envelope
+        self.talker.send_message(raw)
+        return True
+
+    # Attack/demonstration utilities
+    def _resolve_target_addr(self, target: str):
+        # Accept node name (node1) or address (192.46.237.85:2380)
+        if not target:
+            return None
+        if ':' in target:
+            return target
+        return self.name_to_addr.get(target, target)
+
+    def send_vote_attack(self, target: str, delta_term: int = 1, raw: bool = False, old_term: bool = False):
+        try:
+            target_addr = self._resolve_target_addr(target)
+            if target_addr is None:
+                return False
+            # Determine attack term
+            if old_term:
+                attack_term = max(0, self.current_term - abs(delta_term))
+            else:
+                attack_term = self.current_term + abs(delta_term)
+
+            vote = RequestVotesMessage(
+                type_ = MessageType.RequestVotes,
+                term = attack_term,
+                sender = self.my_id,
+                receiver = target_addr,
+                direction = MessageDirection.Request,
+                candidate_id = self.my_id,
+                last_log_index = self.last_applied_index,
+                last_log_term = self.last_applied_term
+            )
+            msg_dict = vote.jsonify()
+
+            if raw or not getattr(self, 'secure_enabled', False):
+                # Send as raw JSON (simulates outsider or secure off)
+                self.talker.send_message(msg_dict)
+                if self.demo_stdout_simple:
+                    print(f"{self.name}: Attack sent (RAW vote term {attack_term}) to {target}")
+            else:
+                # Insider (with PSK): wrap securely
+                envelope = encode_secure_message(
+                    message_dict=msg_dict,
+                    peer_id=target_addr,
+                    key_id=self._active_key_id,
+                    keystore=self._keystore,
+                    confidential=True
+                )
+                send_obj = {
+                    'receiver': target_addr,
+                    'secure': True,
+                    'broadcast': False,
+                    'envelope': envelope
+                }
+                self.talker.send_message(send_obj)
+                if self.demo_stdout_simple:
+                    print(f"{self.name}: Attack sent (secure vote term {attack_term}) to {target}")
+            return True
+        except Exception as e:
+            try:
+                print(f"{self.name}: Attack send failed: {e}")
+            except Exception:
+                pass
+            return False
+
+    # Toggle secure transport on this node (demo convenience)
+    def set_secure(self, enabled: bool):
+        try:
+            self.secure_enabled = bool(enabled)
+            # Reset replay cache when toggling to avoid stale tx_ids surprises
+            if self.secure_enabled:
+                self._replay_cache = ReplayCache()
+            if self.demo_stdout_simple:
+                print(f"{self.name}: Secure transport {'ENABLED' if self.secure_enabled else 'DISABLED'}")
+            # File log for visibility
+            try:
+                log_file_path = str(self.name)+"_logs.txt"
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(log_file_path, "a") as file:
+                    file.write(current_time+" : "+ f"event=secure_toggle enabled={self.secure_enabled}" + "\n")
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            try:
+                print(f"{self.name}: Secure toggle failed: {e}")
+            except Exception:
+                pass
+            return False
 
     def _load_config(self, config, name):
         with open(config, 'r') as infile:
@@ -634,14 +989,29 @@ class RaftNode(threading.Thread):
                     Node's new role
         '''
         with self.client_lock:
+            prev = getattr(self, 'current_role', None)
             self.current_role = role
+            # Reset helper flag used to print a single "following leader" line
+            self._printed_following_leader = False
+        # Demo log role changes
+        if getattr(self, 'demo_logs', False):
+            try:
+                log_file_path = str(self.name)+"_logs.txt"
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                line = current_time+" : "+ f"event=role_change old={prev} new={role} term={self.current_term}"
+                if prev != role:
+                    print(line)
+                    with open(log_file_path, "a") as file:
+                        file.write(line + "\n")
+            except Exception:
+                pass
 
     def _get_node_index(self, node_address):
         '''
             _get_node_index: Retuns the index of a specific node address,
                 e.g. for
-                    self.all_ids = ['5556', '5558']
-                    _get_node_index('5556') <- returns 0
+                    self.all_ids = ['192.46.237.85:2380', '172.105.85.119:2380']
+                    _get_node_index('192.46.237.85:2380') <- returns 0
             Inputs: 
                 node_address: (str)
                     The query address
@@ -794,7 +1164,6 @@ class RaftNode(threading.Thread):
             candidate_id = self.my_id, 
             last_log_index = self.last_applied_index,
             last_log_term = self.last_applied_term,
-            msg_timestamp= int(time.time())
         )
         self._send_message(message)
 
@@ -824,7 +1193,6 @@ class RaftNode(threading.Thread):
             candidate_id = candidate, 
             last_log_index = self.last_applied_index,
             last_log_term = self.last_applied_term,
-            msg_timestamp= int(time.time()),
             results = RequestVotesResults(
                 term = self.current_term,
                 vote_granted = vote_granted

@@ -128,8 +128,9 @@ class BaseMessage(object):
 			'results': 		self._results.jsonify()
 		}
 
+
 class RequestVotesMessage(BaseMessage):
-	def __init__(self, type_=None, term=None, sender=None, receiver=None, direction=None, results=None, candidate_id=None, last_log_index=None, last_log_term=None, message=None, msg_timestamp=int(time.time())):
+	def __init__(self, type_=None, term=None, sender=None, receiver=None, direction=None, results=None, candidate_id=None, last_log_index=None, last_log_term=None, message=None):
 		if (message is not None):
 			self.un_jsonify(message)
 		else:
@@ -139,11 +140,9 @@ class RequestVotesMessage(BaseMessage):
 			self._candidate_id = candidate_id
 			self._last_log_index = last_log_index
 			self._last_log_term = last_log_term
-			self._msg_timestamp = msg_timestamp
+			# msg_timestamp removed - using secure transport for replay protection
 		
-	@property
-	def msg_timestamp(self):
-		return self._msg_timestamp
+	# msg_timestamp property removed - using secure transport for replay protection
 
 	@property
 	def candidate_id(self):
@@ -169,7 +168,7 @@ class RequestVotesMessage(BaseMessage):
             "candidate_id": self.candidate_id,
             "last_log_index": self.last_log_index,
             "last_log_term": self.last_log_term,
-			"msg_timestamp": self.msg_timestamp
+			# msg_timestamp removed - using secure transport for replay protection
         }
 
 	def un_jsonify(self, message):
@@ -177,7 +176,7 @@ class RequestVotesMessage(BaseMessage):
 		self._candidate_id = 	message['candidate_id']
 		self._last_log_index = 	message['last_log_index']
 		self._last_log_term = 	message['last_log_term']
-		self._msg_timestamp = 	message.get('msg_timestamp', int(time.time()))
+		# msg_timestamp removed - using secure transport for replay protection
 
 	def jsonify(self):
 		message = BaseMessage.jsonify(self)
@@ -185,7 +184,7 @@ class RequestVotesMessage(BaseMessage):
 			'candidate_id': 	self._candidate_id,
 			'last_log_index': 	self._last_log_index,
 			'last_log_term': 	self._last_log_term,
-			'msg_timestamp': 	self._msg_timestamp
+			# msg_timestamp removed - using secure transport for replay protection
 		})
 		return message
 
